@@ -142,7 +142,11 @@ type JSService struct {
 	bridgeHandler *BridgeHandler          // 桥接处理器
 	status        ServiceStatus           // 运行状态
 	mu            sync.RWMutex
-	lastActive    time.Time // 最后活跃时间
+	lastActive    time.Time // 最后活跃时间（内部活动：桥接调用/定时器工作都会刷新）
+	// 最后用户指令时间：只在 HandleMessage（用户请求入口）更新。
+	// 与 lastActive 区分——后台定时器（如对话轮询）不会刷新它，用于驱动
+	// 动态 ticker：用户指令后 idleThreshold 内用快节奏(50ms)，之后回待机(1s)。
+	lastUserActivity time.Time
 
 	// 定时器 goroutine 的停止信号。用独立的 timerMu 而不是 s.mu 保护：s.mu 被
 	// HandleMessage / Load 等长操作持有，而 armTimerStop / stopTimerProcessor 只做
@@ -157,11 +161,12 @@ type JSService struct {
 // NewJSService 创建新的 JS 服务实例
 func NewJSService(plugin *JSPlugin, scheduler *ServiceScheduler, jsManager *jsruntime.JSEnvManager) *JSService {
 	return &JSService{
-		plugin:     plugin,
-		scheduler:  scheduler,
-		jsManager:  jsManager,
-		status:     ServiceStatusStopped,
-		lastActive: time.Now(),
+		plugin:           plugin,
+		scheduler:        scheduler,
+		jsManager:        jsManager,
+		status:           ServiceStatusStopped,
+		lastActive:       time.Now(),
+		lastUserActivity: time.Now(),
 	}
 }
 
@@ -428,13 +433,33 @@ func (s *JSService) stopTimerProcessor() {
 
 // runTimerProcessor 独立 goroutine，周期性处理 JS 定时器。
 // 使用 TryLock 确保不阻塞 HTTP 请求处理。
+//
+// 动态节奏：用户指令（HandleMessage 更新 lastUserActivity）后 idleThreshold 内
+// 用 fastInterval 快节奏推进 JS 异步（await/fetch/songloft.* 恢复更及时，响应更快）；
+// 长时间无用户指令则回到 slowInterval 待机，降低 CPU 占用。
+// 单 timer 每次触发后按当前模式 Reset，无跨 goroutine 改周期的竞态。
+const (
+	fastTimerInterval = 50 * time.Millisecond // 活跃节奏：用户指令后
+	slowTimerInterval = 1 * time.Second       // 待机节奏：无指令
+	idleThreshold     = 5 * time.Minute       // 无指令多久回待机
+)
+
+func (s *JSService) timerInterval() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if time.Since(s.lastUserActivity) < idleThreshold {
+		return fastTimerInterval
+	}
+	return slowTimerInterval
+}
+
 func (s *JSService) runTimerProcessor(timerStop <-chan struct{}) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	timer := time.NewTimer(s.timerInterval())
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			// 如果定时器实际执行了，更新 lastActive 时间戳
 			// 这样有活跃定时器的插件不会被误判为空闲
 			if s.jsManager.ProcessTimers(s.envID) {
@@ -442,6 +467,7 @@ func (s *JSService) runTimerProcessor(timerStop <-chan struct{}) {
 				s.lastActive = time.Now()
 				s.mu.Unlock()
 			}
+			timer.Reset(s.timerInterval())
 		case <-timerStop:
 			return
 		}
@@ -452,6 +478,7 @@ func (s *JSService) runTimerProcessor(timerStop <-chan struct{}) {
 func (s *JSService) HandleMessage(msg *Message) *Message {
 	s.mu.Lock()
 	s.lastActive = time.Now()
+	s.lastUserActivity = time.Now()
 	s.status = ServiceStatusRunning
 	s.mu.Unlock()
 	defer func() {
