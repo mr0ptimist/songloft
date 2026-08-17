@@ -453,15 +453,38 @@ func (s *JSService) timerInterval() time.Duration {
 	return slowTimerInterval
 }
 
+// markUserActivity 由 plugin.signalActivity 桥接调用：插件在真实语音消息
+// （ConversationMonitor 轮询进入 handleMessage）入口通知宿主，让动态 ticker
+// 在用户活跃时保持快节奏。与 HandleMessage 里的更新等价，只是来源是插件 JS。
+func (s *JSService) markUserActivity() {
+	s.mu.Lock()
+	s.lastUserActivity = time.Now()
+	s.mu.Unlock()
+}
+
 func (s *JSService) runTimerProcessor(timerStop <-chan struct{}) {
 	timer := time.NewTimer(s.timerInterval())
 	defer timer.Stop()
+	// 桥接结果 / 宿主事件到达即唤醒，不等下一个（可能很慢的）tick。
+	// 真实语音消息走插件 JS 内轮询（ConversationMonitor → handleMessage），
+	// 全程在 ProcessTimers 上下文里推进，没有 ExecuteJS 慢路径的 asyncSignal select；
+	// 没有这路唤醒，慢节奏（1s）下每个 await 都要卡一个整 tick。
+	asyncSignal := s.jsManager.AsyncSignal(s.envID)
 
 	for {
 		select {
 		case <-timer.C:
 			// 如果定时器实际执行了，更新 lastActive 时间戳
 			// 这样有活跃定时器的插件不会被误判为空闲
+			if s.jsManager.ProcessTimers(s.envID) {
+				s.mu.Lock()
+				s.lastActive = time.Now()
+				s.mu.Unlock()
+			}
+			timer.Reset(s.timerInterval())
+		case <-asyncSignal:
+			// 有新的桥接结果/宿主事件：立即 pump，让挂起的 await 尽快恢复。
+			// 慢节奏待机时 CPU 代价可忽略（桥接调用本就稀疏）。
 			if s.jsManager.ProcessTimers(s.envID) {
 				s.mu.Lock()
 				s.lastActive = time.Now()

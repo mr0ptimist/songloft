@@ -1331,6 +1331,21 @@ func (m *JSEnvManager) ProcessTimers(envID string) bool {
 	return didAnyWork
 }
 
+// AsyncSignal 返回该 env 的异步唤醒通道：桥接结果 / 宿主事件到达时被信号。
+// 供动态 ticker 使用——真实语音（ConversationMonitor 轮询→handleMessage）里的
+// await 不经过 ExecuteJS 慢路径（无 asyncSignal select），只能靠 tick 推进；
+// ticker 多选一路这个通道，桥接结果一落地就立即 pump，不再等下一个慢 tick。
+// env 不存在时返回已关闭通道（select 立即唤醒，调用方 pump 失败后 Reset 即可）。
+func (m *JSEnvManager) AsyncSignal(envID string) <-chan struct{} {
+	env, err := m.getEnv(envID)
+	if err != nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return env.asyncSignal
+}
+
 // GetNextTimerDeadline 返回下一个定时器的执行时间。
 // 无活跃定时器返回零值 time.Time（IsZero() == true）。
 // 使用 TryLock，VM 忙时返回当前时间——

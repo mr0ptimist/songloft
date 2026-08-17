@@ -323,6 +323,12 @@ songloft.plugin = {
     getHostUrl: async function() {
         return await __callBridge('plugin.getHostUrl', '');
     },
+    // 通知宿主"用户刚发指令"，让动态 ticker 从慢节奏切回快节奏。
+    // 插件侧可 fire-and-forget（不 await）：桥接动作在 goroutine 里同步更新
+    // lastUserActivity，返回的 Promise 由下个 pump 自然解决，时序无关紧要。
+    signalActivity: async function() {
+        return await __callBridge('plugin.signalActivity', '');
+    },
     getFileUrl: async function(filePath) {
         var r = await __callBridge('plugin.getFileUrl', JSON.stringify({filePath: filePath}));
         return JSON.parse(r).url;
@@ -1458,6 +1464,13 @@ func (h *BridgeHandler) handlePlugin(action, data string) (string, error) {
 			port = "58091"
 		}
 		return fmt.Sprintf("http://localhost:%s", port), nil
+
+	case "plugin.signalActivity":
+		// 插件（真实语音 handleMessage 入口）通知宿主"用户刚发指令"，
+		// 让动态 ticker 切回快节奏（lastUserActivity 只在宿主消息入口更新，
+		// 而真实语音走插件 JS 内轮询，不经 HandleMessage——见 service.go 注释）。
+		h.service.markUserActivity()
+		return "", nil
 
 	case "plugin.getNetworkAddresses":
 		port := h.port
